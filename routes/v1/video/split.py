@@ -71,8 +71,8 @@ def video_split(job_id, data):
     logger.info(f"Job {job_id}: Received video split request for {video_url}")
     
     try:
-        # Process the video file and get list of output files
-        output_files, input_filename = split_video(
+        # Process the video file and get list of output splits
+        output_splits, input_filename = split_video(
             video_url=video_url,
             splits=splits,
             job_id=job_id,
@@ -83,21 +83,18 @@ def video_split(job_id, data):
             audio_bitrate=audio_bitrate
         )
         
-        # Upload all output files to cloud storage
-        from services.cloud_storage import upload_file
+        # Prepare the result files with URLs and timestamps
+        logger.info(f"Job {job_id}: Video split operation completed, processing output files")
         result_files = []
-        
-        for i, output_file in enumerate(output_files):
-            cloud_url = upload_file(output_file)
+
+        for i, output_split in enumerate(output_splits):
             result_files.append({
-                "file_url": cloud_url,
-                "start": splits[i]["start"],
-                "end": splits[i]["end"]
+                "split_index": output_split["split_index"],
+                "file_url": output_split["file_url"],
+                "start": output_split["start"],
+                "end": output_split["end"]
             })
-            # Remove the local file after upload
-            import os
-            os.remove(output_file)
-            logger.info(f"Job {job_id}: Uploaded and removed split file {i+1}")
+
         
         # Clean up input file
         import os

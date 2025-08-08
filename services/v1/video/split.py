@@ -21,9 +21,10 @@ import json
 import subprocess
 import logging
 import uuid
-from services.file_management import download_file
+from services.file_management import download_file, get_filename_from_url
 from services.cloud_storage import upload_file
 from config import LOCAL_STORAGE_PATH
+import requests
 
 # Set up logging
 logger = logging.getLogger(__name__)
@@ -73,11 +74,54 @@ def split_video(video_url, splits, job_id=None, video_codec='libx264', video_pre
     logger.info(f"Starting video split operation for {video_url}")
     if not job_id:
         job_id = str(uuid.uuid4())
-        
-    input_filename = download_file(video_url, os.path.join(LOCAL_STORAGE_PATH, f"{job_id}_input"))
-    logger.info(f"Downloaded video to local file: {input_filename}")
+
+    # Change video_url extension to .json then check if the JSON file exists in Cloud Storage
+    video_json_url = video_url.rsplit('.', 1)[0] + '.json'
+    try:
+        # Try to check if the JSON file is accessible before downloading
+        """
+            video_path (str, optional): Local path to video file. If provided and exists, use it directly.
+            video_splits (list, optional): List of existing split segments to check for duplicates.
+        """
+        response = requests.head(video_json_url)
+        if response.status_code == 200:
+            video_json_path = download_file(video_json_url, os.path.join(LOCAL_STORAGE_PATH, f"{job_id}_input"))
+            logger.info(f"Downloaded video_json to local file: {video_json_path}")
+        else:
+            logger.warning(f"JSON file not found at {video_json_url}, status code: {response.status_code}")
+            video_json_path = None
+    except Exception as e:
+        logger.warning(f"Failed to check or download JSON file: {str(e)}")
+        video_json_path = None
+
+    # Get video_json_file name from URL
+    video_json_file = get_filename_from_url(video_json_url)
+
+    # Read the JSON file and parse to get the video URL and splits
+    if video_json_path:
+        try:
+            with open(video_json_path, 'r') as f:
+                video_json = json.load(f)
+                video_path = video_json.get('video_path', video_path)
+                video_splits = video_json.get('video_splits', video_splits)
+                logger.info(f"Loaded video URL: {video_path} and video splits from JSON file")
+        except Exception as e:
+            logger.error(f"Failed to read JSON file: {str(e)}")
+            raise ValueError("Invalid JSON file format or content")
+    else:
+        video_path = None
+        video_splits = []
+        logger.info("No JSON file found, using provided video URL and splits")
+
+    # Only download if video_path is None or file does not exist
+    if video_path is None or (video_path and not os.path.exists(video_path)):
+        input_filename = download_file(video_url, os.path.join(LOCAL_STORAGE_PATH, f"{job_id}_input"))
+        logger.info(f"Downloaded video to local file: {input_filename}")
+    else:
+        input_filename = video_path
+        logger.info(f"Using provided local video file: {input_filename}")
     
-    output_files = []
+    temp_files = []
     
     try:
         # Get the file extension
@@ -99,7 +143,7 @@ def split_video(video_url, splits, job_id=None, video_codec='libx264', video_pre
         except (ValueError, IndexError):
             logger.warning("Could not determine file duration, using a large value")
             file_duration = 86400  # 24 hours as a fallback
-        
+
         # Validate and process splits
         valid_splits = []
         for i, split in enumerate(splits):
@@ -120,7 +164,7 @@ def split_video(video_url, splits, job_id=None, video_codec='libx264', video_pre
                     logger.warning(f"Split {i+1} end time {split['end']} exceeds file duration, using file duration instead")
                     end_seconds = file_duration
                     
-                # Only add valid splits
+                # Check if split is valid
                 if start_seconds < end_seconds:
                     valid_splits.append((i, start_seconds, end_seconds, split))
             except ValueError as e:
@@ -134,8 +178,17 @@ def split_video(video_url, splits, job_id=None, video_codec='libx264', video_pre
         # Process each split
         for index, (split_index, start_seconds, end_seconds, split_data) in enumerate(valid_splits):
             # Create output filename for this split
-            output_filename = os.path.join(LOCAL_STORAGE_PATH, f"{job_id}_split_{index+1}{ext}")
+            output_filename = os.path.join(LOCAL_STORAGE_PATH, f"{job_id}_split_{split_index+1}{ext}")
             
+            # Check if split is in video_splits
+            is_duplicate = any(
+                split_data['start'] == vs.get('start') and split_data['end'] == vs.get('end')
+                for vs in video_splits or []
+            )
+            if is_duplicate:
+                logger.info(f"Split {split_index+1} is a duplicate of an existing split, skipping encoding")
+                continue
+
             # Create FFmpeg command to extract the segment
             cmd = [
                 'ffmpeg',
@@ -151,31 +204,70 @@ def split_video(video_url, splits, job_id=None, video_codec='libx264', video_pre
                 output_filename
             ]
             
-            logger.info(f"Running FFmpeg command for split {index+1}: {' '.join(cmd)}")
+            logger.info(f"Running FFmpeg command for split {split_index+1}: {' '.join(cmd)}")
             
             # Run the FFmpeg command
             process = subprocess.run(cmd, capture_output=True, text=True)
             
             if process.returncode != 0:
-                logger.error(f"Error processing split {index+1}: {process.stderr}")
-                raise Exception(f"FFmpeg error for split {index+1}: {process.stderr}")
+                logger.error(f"Error processing split {split_index+1}: {process.stderr}")
+                raise Exception(f"FFmpeg error for split {split_index+1}: {process.stderr}")
             
-            # Add the output file to the list
-            output_files.append(output_filename)
-            logger.info(f"Successfully created split {index+1}: {output_filename}")
+            # Log the successful creation of the split file
+            logger.info(f"Successfully created split {split_index+1}: {output_filename}")
+
+            # Upload the output file to cloud storage
+            cloud_url = upload_file(output_filename)
+            if not cloud_url:
+                raise Exception(f"Failed to upload split {split_index+1} to cloud storage")
+            
+            # Add the split data to video_splits
+            video_splits.append({
+                "split_index": split_index+1,
+                "file_url": cloud_url,
+                "start": split_data["start"],
+                "end": split_data["end"]
+            })
+            # Sort video_splits by split_index ascending
+            video_splits.sort(key=lambda x: x["split_index"])
+
+            # upload the updated video_splits JSON to cloud storage
+            # Write video_splits_json to a temporary local file before uploading
+            video_json['video_path'] = input_filename
+            video_json['video_splits'] = video_splits
+            video_splits_json = json.dumps(video_json, indent=4)
+            temp_json_path = os.path.join(LOCAL_STORAGE_PATH, video_json_file)
+            with open(temp_json_path, 'w') as json_f:
+                json_f.write(video_splits_json)
+            cloud_url = upload_file(temp_json_path)
+            if not cloud_url:
+                raise Exception(f"Failed to upload video splits JSON to cloud storage")
+            
+            # Log the successful upload of the JSON file
+            logger.info(f"Uploaded video JSON to cloud storage: {cloud_url}")
+
+            # Add the output filename and JSON path to the list of temporary files
+            temp_files.append(output_filename)
+            temp_files.append(temp_json_path)
+            
+            # Remove the temporary local JSON file after upload
+            os.remove(temp_json_path)
+
+            # Remove the local file after upload
+            os.remove(output_filename)
         
         # Return the list of output files and the input filename
-        return output_files, input_filename
-        
+        return video_splits, input_filename
+
     except Exception as e:
         logger.error(f"Video split operation failed: {str(e)}")
         
         # Clean up all temporary files if they exist
         if 'input_filename' in locals() and os.path.exists(input_filename):
             os.remove(input_filename)
-                
-        for output_file in output_files:
-            if os.path.exists(output_file):
-                os.remove(output_file)
-                
+
+        for f in temp_files:
+            if os.path.exists(f):
+                os.remove(f)
+
         raise

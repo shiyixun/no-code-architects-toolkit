@@ -55,6 +55,40 @@ def get_extension_from_url(url):
     # If we can't determine the extension, raise an error
     raise ValueError(f"Could not determine file extension from URL: {url}")
 
+def get_filename_from_url(url):
+    """
+    Extract filename from URL path or content type.
+
+    Args:
+        url (str): The URL to extract the filename from
+
+    Returns:
+        str: The filename including extension
+
+    Raises:
+        ValueError: If no valid filename can be determined from the URL
+    """
+
+    # First try to get filename from URL
+    parsed_url = urlparse(url)
+    path = parsed_url.path
+    filename = os.path.basename(path)
+    if filename and '.' in filename:
+        return filename
+    
+    # If no filename in URL, try to determine from content type
+    try:
+        response = requests.head(url, allow_redirects=True)
+        cd = response.headers.get('content-disposition', '')
+        if cd:
+            fname_match = re.findall('filename="?([^"]+)"?', cd)
+            if fname_match:
+                return fname_match[0]
+    except Exception:
+        pass
+
+    raise ValueError(f"Could not determine filename from URL: {url}")
+
 def download_file(url, storage_path="/tmp/"):
     """Download a file from URL to local storage."""
     # Create storage directory if it doesn't exist
