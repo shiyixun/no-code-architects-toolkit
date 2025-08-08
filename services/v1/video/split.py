@@ -102,13 +102,25 @@ def split_video(video_url, splits, job_id=None, video_codec='libx264', video_pre
         try:
             with open(video_json_path, 'r') as f:
                 video_json = json.load(f)
-                video_path = video_json.get('video_path', video_path)
-                video_splits = video_json.get('video_splits', video_splits)
+                if not isinstance(video_json, dict):
+                    logger.error("JSON file does not contain a valid object, using default values")
+                    video_json = {}
+                    video_path = None
+                    video_splits = []
+                else:
+                    video_path = video_json.get('video_path', None)
+                    video_splits = video_json.get('video_splits', [])
+                    if not isinstance(video_splits, list):
+                        logger.error("video_splits in JSON file is not a list, using default value []")
+                        video_splits = []
                 logger.info(f"Loaded video URL: {video_path} and video splits from JSON file")
         except Exception as e:
-            logger.error(f"Failed to read JSON file: {str(e)}")
-            raise ValueError("Invalid JSON file format or content")
+            logger.error(f"Failed to read or parse JSON file: {str(e)}, using default values")
+            video_json = {}
+            video_path = None
+            video_splits = []
     else:
+        video_json = {}
         video_path = None
         video_splits = []
         logger.info("No JSON file found, using provided video URL and splits")
